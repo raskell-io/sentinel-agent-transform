@@ -1,0 +1,65 @@
+[package]
+name = "sentinel-agent-transform"
+version = "0.1.0"
+edition = "2021"
+authors = ["Raskell <hello@raskell.io>"]
+description = "Request and response transformation agent for Sentinel proxy"
+license = "Apache-2.0"
+repository = "https://github.com/raskell-io/sentinel-agent-transform"
+keywords = ["sentinel", "proxy", "agent", "transform", "rewrite"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+# Sentinel SDK
+sentinel-agent-sdk = { git = "https://github.com/raskell-io/sentinel-agent-rust-sdk.git", branch = "main" }
+sentinel-agent-protocol = { git = "https://github.com/raskell-io/sentinel.git", branch = "main" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Pattern matching
+regex = "1"
+glob = "0.3"
+
+# Template engine
+tera = "1"
+
+# JSON path queries
+jsonpath-rust = "0.7"
+
+# XML parsing
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Utilities
+base64 = "0.22"
+urlencoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+
+[[bin]]
+name = "sentinel-agent-transform"
+path = "src/main.rs"
+
+[lib]
+name = "sentinel_agent_transform"
+path = "src/lib.rs"
