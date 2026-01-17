@@ -5,9 +5,16 @@ use crate::context::{RequestInfo, ResponseInfo, TransformContext};
 use crate::rule::{RuleEngine, RuleError};
 use crate::transformer::TransformResult;
 use async_trait::async_trait;
-use sentinel_agent_protocol::BodyMutation;
-use sentinel_agent_sdk::{Agent, Decision, Request, Response};
+use sentinel_agent_protocol::v2::{
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, CounterMetric, DrainReason,
+    GaugeMetric, HealthStatus, MetricsReport, ShutdownReason,
+};
+use sentinel_agent_protocol::{
+    AgentResponse, AuditMetadata, EventType, HeaderOp, RequestBodyChunkEvent,
+    RequestHeadersEvent, ResponseBodyChunkEvent, ResponseHeadersEvent,
+};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -24,6 +31,14 @@ pub struct TransformAgent {
     /// Request contexts (keyed by correlation_id)
     /// Used to pass context from on_request to on_response
     request_contexts: Arc<RwLock<HashMap<String, StoredContext>>>,
+    /// Whether the agent is draining (not accepting new requests).
+    draining: AtomicBool,
+    /// Metrics: total requests processed.
+    requests_total: AtomicU64,
+    /// Metrics: total requests transformed.
+    requests_transformed: AtomicU64,
+    /// Metrics: total transform errors.
+    transform_errors: AtomicU64,
 }
 
 /// Stored context for a request (used between phases).
@@ -51,6 +66,10 @@ impl TransformAgent {
             config,
             rule_engine,
             request_contexts: Arc::new(RwLock::new(HashMap::new())),
+            draining: AtomicBool::new(false),
+            requests_total: AtomicU64::new(0),
+            requests_transformed: AtomicU64::new(0),
+            transform_errors: AtomicU64::new(0),
         })
     }
 
@@ -66,18 +85,21 @@ impl TransformAgent {
         Self::new(config).map_err(TransformAgentError::from)
     }
 
-    /// Build request info from SDK request.
-    fn build_request_info(&self, request: &Request) -> RequestInfo {
-        let headers: HashMap<String, Vec<String>> = request
-            .headers()
+    /// Build request info from request headers event.
+    fn build_request_info(&self, event: &RequestHeadersEvent) -> RequestInfo {
+        let headers: HashMap<String, Vec<String>> = event
+            .headers
             .iter()
             .map(|(k, v)| (k.to_lowercase(), v.clone()))
             .collect();
 
         // Parse query string from path
-        let full_path = request.path();
+        let full_path = &event.uri;
         let (path, query_string) = if let Some(pos) = full_path.find('?') {
-            (full_path[..pos].to_string(), Some(full_path[pos + 1..].to_string()))
+            (
+                full_path[..pos].to_string(),
+                Some(full_path[pos + 1..].to_string()),
+            )
         } else {
             (full_path.to_string(), None)
         };
@@ -85,26 +107,26 @@ impl TransformAgent {
         let query_params = parse_query_string(query_string.as_deref());
 
         RequestInfo {
-            method: request.method().to_string(),
+            method: event.method.clone(),
             path,
             query_string,
             query_params,
             headers,
-            client_ip: request.client_ip().to_string(),
+            client_ip: event.metadata.client_ip.clone(),
         }
     }
 
-    /// Build response info from SDK response.
-    fn build_response_info(&self, response: &Response) -> ResponseInfo {
+    /// Build response info from response headers event.
+    fn build_response_info(&self, event: &ResponseHeadersEvent) -> ResponseInfo {
         use crate::context::status_text;
 
-        let headers: HashMap<String, Vec<String>> = response
-            .headers()
+        let headers: HashMap<String, Vec<String>> = event
+            .headers
             .iter()
             .map(|(k, v)| (k.to_lowercase(), v.clone()))
             .collect();
 
-        let status = response.status_code();
+        let status = event.status;
 
         ResponseInfo {
             status,
@@ -114,37 +136,40 @@ impl TransformAgent {
     }
 
     /// Apply transform result to decision.
-    fn apply_request_transforms(&self, result: TransformResult, rule_name: &str) -> Decision {
-        let mut decision = Decision::allow();
+    fn apply_request_transforms(&self, result: TransformResult, rule_name: &str) -> AgentResponse {
+        let mut response = AgentResponse::default_allow();
 
         // Add headers
         for (name, value) in result.add_headers {
-            decision = decision.add_request_header(name, value);
+            response = response.add_request_header(HeaderOp::Set { name, value });
         }
 
         // Remove headers
         for name in result.remove_headers {
-            decision = decision.remove_request_header(name);
+            response = response.add_request_header(HeaderOp::Remove { name });
         }
 
         // URL rewriting (passed via routing metadata for proxy to use)
         if let Some(new_url) = result.new_url {
-            decision = decision
-                .with_routing_metadata("rewritten_path", new_url.clone())
-                .add_request_header("X-Original-Path", new_url);
-        }
-
-        // Method override (passed via routing metadata)
-        if let Some(new_method) = result.new_method {
-            decision = decision.with_routing_metadata("rewritten_method", new_method);
+            response = response.add_request_header(HeaderOp::Set {
+                name: "X-Original-Path".to_string(),
+                value: new_url,
+            });
         }
 
         // Add debug headers if enabled
         if self.config.settings.debug_headers {
-            decision = decision.add_response_header("X-Transform-Rule", rule_name.to_string());
+            response = response.add_response_header(HeaderOp::Set {
+                name: "X-Transform-Rule".to_string(),
+                value: rule_name.to_string(),
+            });
         }
 
-        decision.with_tag("transformed")
+        let audit = AuditMetadata {
+            tags: vec!["transformed".to_string()],
+            ..Default::default()
+        };
+        response.with_audit(audit)
     }
 
     /// Apply transform result to response decision.
@@ -153,28 +178,34 @@ impl TransformAgent {
         result: TransformResult,
         rule_name: &str,
         start_time: Instant,
-    ) -> Decision {
-        let mut decision = Decision::allow();
+    ) -> AgentResponse {
+        let mut response = AgentResponse::default_allow();
 
         // Add response headers
         for (name, value) in result.add_headers {
-            decision = decision.add_response_header(name, value);
+            response = response.add_response_header(HeaderOp::Set { name, value });
         }
 
         // Remove response headers
         for name in result.remove_headers {
-            decision = decision.remove_response_header(name);
+            response = response.add_response_header(HeaderOp::Remove { name });
         }
 
         // Add debug headers if enabled
         if self.config.settings.debug_headers {
             let duration = start_time.elapsed();
-            decision = decision
-                .add_response_header("X-Transform-Rule", rule_name.to_string())
-                .add_response_header("X-Transform-Time", format!("{}ms", duration.as_millis()));
+            response = response
+                .add_response_header(HeaderOp::Set {
+                    name: "X-Transform-Rule".to_string(),
+                    value: rule_name.to_string(),
+                })
+                .add_response_header(HeaderOp::Set {
+                    name: "X-Transform-Time".to_string(),
+                    value: format!("{}ms", duration.as_millis()),
+                });
         }
 
-        decision
+        response
     }
 
     /// Store context for later phases.
@@ -200,23 +231,32 @@ impl TransformAgent {
         let mut contexts = self.request_contexts.write().await;
         contexts.remove(correlation_id)
     }
+
+    /// Check if agent is draining.
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
 }
 
 /// Parse query string into parameter map.
 fn parse_query_string(query: Option<&str>) -> HashMap<String, Vec<String>> {
-    let mut params = HashMap::new();
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
 
     if let Some(qs) = query {
         for part in qs.split('&') {
             if let Some((k, v)) = part.split_once('=') {
-                let key = urlencoding::decode(k).unwrap_or_else(|_| k.into()).to_string();
-                let value = urlencoding::decode(v).unwrap_or_else(|_| v.into()).to_string();
-                params.entry(key).or_insert_with(Vec::new).push(value);
+                let key = urlencoding::decode(k)
+                    .unwrap_or_else(|_| k.into())
+                    .to_string();
+                let value = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .to_string();
+                params.entry(key).or_default().push(value);
             } else if !part.is_empty() {
                 let key = urlencoding::decode(part)
                     .unwrap_or_else(|_| part.into())
                     .to_string();
-                params.entry(key).or_insert_with(Vec::new).push(String::new());
+                params.entry(key).or_default().push(String::new());
             }
         }
     }
@@ -225,17 +265,53 @@ fn parse_query_string(query: Option<&str>) -> HashMap<String, Vec<String>> {
 }
 
 #[async_trait]
-impl Agent for TransformAgent {
-    fn name(&self) -> &str {
-        "transform"
+impl AgentHandlerV2 for TransformAgent {
+    /// Return agent capabilities for v2 protocol.
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new(
+            "transform",
+            "Transform Agent",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_event(EventType::RequestHeaders)
+        .with_event(EventType::RequestBodyChunk)
+        .with_event(EventType::ResponseHeaders)
+        .with_event(EventType::ResponseBodyChunk)
+        .with_features(AgentFeatures {
+            streaming_body: true,
+            websocket: false,
+            guardrails: false,
+            config_push: true,
+            metrics_export: true,
+            concurrent_requests: 100,
+            cancellation: true,
+            flow_control: false,
+            health_reporting: true,
+        })
+        .with_limits(AgentLimits {
+            max_body_size: self.config.settings.max_body_size,
+            max_concurrency: 100,
+            preferred_chunk_size: 64 * 1024,
+            max_memory: None,
+            max_processing_time_ms: Some(self.config.settings.timeout_ms),
+        })
     }
 
-    async fn on_request(&self, request: &Request) -> Decision {
+    /// Handle request headers event.
+    async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+
+        // Check if draining
+        if self.is_draining() {
+            debug!("Agent is draining, allowing request");
+            return AgentResponse::default_allow();
+        }
+
         let start_time = Instant::now();
-        let correlation_id = request.correlation_id();
+        let correlation_id = &event.metadata.correlation_id;
 
         // Build context
-        let request_info = self.build_request_info(request);
+        let request_info = self.build_request_info(&event);
         let ctx = TransformContext::new(request_info, correlation_id.to_string());
 
         // Find matching rule
@@ -243,7 +319,7 @@ impl Agent for TransformAgent {
             Some((r, c)) => (r, c),
             None => {
                 trace!(correlation_id, "No matching request transform rule");
-                return Decision::allow();
+                return AgentResponse::default_allow();
             }
         };
 
@@ -257,7 +333,7 @@ impl Agent for TransformAgent {
         let ctx = ctx.with_captures(captures);
 
         // Apply transformations
-        let result = match rule.transform_request(&ctx, request.body()).await {
+        let result = match rule.transform_request(&ctx, None).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -266,7 +342,8 @@ impl Agent for TransformAgent {
                     error = %e,
                     "Request transformation failed"
                 );
-                return Decision::allow();
+                self.transform_errors.fetch_add(1, Ordering::Relaxed);
+                return AgentResponse::default_allow();
             }
         };
 
@@ -282,15 +359,9 @@ impl Agent for TransformAgent {
         .await;
 
         // Build decision
-        let mut decision = self.apply_request_transforms(result.clone(), &rule.name);
+        let response = self.apply_request_transforms(result.clone(), &rule.name);
 
-        // Handle body transformation
-        if let Some(body) = result.body {
-            decision = decision.with_request_body_mutation(BodyMutation::replace(
-                0,
-                String::from_utf8_lossy(&body).to_string(),
-            ));
-        }
+        self.requests_transformed.fetch_add(1, Ordering::Relaxed);
 
         info!(
             correlation_id,
@@ -300,25 +371,42 @@ impl Agent for TransformAgent {
             "Applied request transformations"
         );
 
-        decision
+        response
     }
 
-    async fn on_request_body(&self, request: &Request) -> Decision {
-        let correlation_id = request.correlation_id();
+    /// Handle request body chunk event.
+    async fn on_request_body_chunk(&self, event: RequestBodyChunkEvent) -> AgentResponse {
+        let correlation_id = &event.correlation_id;
 
         // Get stored context
         let stored = match self.get_context(correlation_id).await {
             Some(s) => s,
-            None => return Decision::allow(),
+            None => return AgentResponse::default_allow(),
+        };
+
+        // Decode body from base64
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let body = match STANDARD.decode(&event.data) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to decode body from base64");
+                // Re-store context for response phase
+                self.store_context(
+                    correlation_id,
+                    StoredContext {
+                        ctx: stored.ctx,
+                        rule_name: stored.rule_name,
+                        start_time: stored.start_time,
+                    },
+                )
+                .await;
+                return AgentResponse::default_allow();
+            }
         };
 
         // Parse body as JSON if possible
-        let ctx = if let Some(body) = request.body() {
-            if let Ok(json) = serde_json::from_slice(body) {
-                stored.ctx.with_body_json(json)
-            } else {
-                stored.ctx
-            }
+        let ctx = if let Ok(json) = serde_json::from_slice(&body) {
+            stored.ctx.with_body_json(json)
         } else {
             stored.ctx
         };
@@ -337,12 +425,12 @@ impl Agent for TransformAgent {
                     },
                 )
                 .await;
-                return Decision::allow();
+                return AgentResponse::default_allow();
             }
         };
 
         // Apply body transformations
-        let result = match rule.transform_request(&ctx, request.body()).await {
+        let result = match rule.transform_request(&ctx, Some(&body)).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -351,6 +439,7 @@ impl Agent for TransformAgent {
                     error = %e,
                     "Request body transformation failed"
                 );
+                self.transform_errors.fetch_add(1, Ordering::Relaxed);
                 // Re-store context for response phase
                 self.store_context(
                     correlation_id,
@@ -361,7 +450,7 @@ impl Agent for TransformAgent {
                     },
                 )
                 .await;
-                return Decision::allow();
+                return AgentResponse::default_allow();
             }
         };
 
@@ -377,42 +466,38 @@ impl Agent for TransformAgent {
         .await;
 
         // Build decision with body mutation
-        let mut decision = Decision::allow();
+        let response = AgentResponse::default_allow();
 
         if let Some(body) = result.body {
-            decision = decision.with_request_body_mutation(BodyMutation::replace(
-                0,
-                String::from_utf8_lossy(&body).to_string(),
-            ));
+            // Note: Body mutation would need to be handled differently in v2
+            // For now, we log and skip the body mutation
             debug!(
                 correlation_id,
                 rule = %rule.name,
-                "Applied request body transformation"
+                body_size = body.len(),
+                "Request body transformation produced new body (mutation not supported in this version)"
             );
         }
 
-        decision
+        response
     }
 
-    async fn on_response(&self, request: &Request, response: &Response) -> Decision {
-        let correlation_id = request.correlation_id();
+    /// Handle response headers event.
+    async fn on_response_headers(&self, event: ResponseHeadersEvent) -> AgentResponse {
+        let correlation_id = &event.correlation_id;
 
         // Get stored context or create new one
         let stored = self.get_context(correlation_id).await;
         let (ctx, rule_name, start_time) = match stored {
             Some(s) => (s.ctx, s.rule_name, s.start_time),
             None => {
-                let request_info = self.build_request_info(request);
-                (
-                    TransformContext::new(request_info, correlation_id.to_string()),
-                    None,
-                    Instant::now(),
-                )
+                // No stored context, create a minimal one
+                return AgentResponse::default_allow();
             }
         };
 
         // Add response info to context
-        let response_info = self.build_response_info(response);
+        let response_info = self.build_response_info(&event);
         let ctx = ctx.with_response(response_info);
 
         // Find matching response rule
@@ -422,15 +507,18 @@ impl Agent for TransformAgent {
                 // No response transforms, but add debug headers if we have a rule name
                 if self.config.settings.debug_headers {
                     if let Some(name) = rule_name {
-                        return Decision::allow()
-                            .add_response_header("X-Transform-Rule", name)
-                            .add_response_header(
-                                "X-Transform-Time",
-                                format!("{}ms", start_time.elapsed().as_millis()),
-                            );
+                        return AgentResponse::default_allow()
+                            .add_response_header(HeaderOp::Set {
+                                name: "X-Transform-Rule".to_string(),
+                                value: name,
+                            })
+                            .add_response_header(HeaderOp::Set {
+                                name: "X-Transform-Time".to_string(),
+                                value: format!("{}ms", start_time.elapsed().as_millis()),
+                            });
                     }
                 }
-                return Decision::allow();
+                return AgentResponse::default_allow();
             }
         };
 
@@ -454,7 +542,7 @@ impl Agent for TransformAgent {
         )
         .await;
 
-        // Apply header transformations (body is handled in on_response_body)
+        // Apply header transformations (body is handled in on_response_body_chunk)
         let result = match rule.transform_response(&ctx, None).await {
             Ok(r) => r,
             Err(e) => {
@@ -464,11 +552,12 @@ impl Agent for TransformAgent {
                     error = %e,
                     "Response transformation failed"
                 );
-                return Decision::allow();
+                self.transform_errors.fetch_add(1, Ordering::Relaxed);
+                return AgentResponse::default_allow();
             }
         };
 
-        let decision = self.apply_response_transforms(result, &rule.name, start_time);
+        let response = self.apply_response_transforms(result, &rule.name, start_time);
 
         info!(
             correlation_id,
@@ -476,30 +565,37 @@ impl Agent for TransformAgent {
             "Applied response transformations"
         );
 
-        decision
+        response
     }
 
-    async fn on_response_body(&self, request: &Request, response: &Response) -> Decision {
-        let correlation_id = request.correlation_id();
+    /// Handle response body chunk event.
+    async fn on_response_body_chunk(&self, event: ResponseBodyChunkEvent) -> AgentResponse {
+        let correlation_id = &event.correlation_id;
 
         // Get stored context
         let stored = match self.get_context(correlation_id).await {
             Some(s) => s,
-            None => return Decision::allow(),
+            None => return AgentResponse::default_allow(),
         };
 
         let rule_name = match stored.rule_name {
             Some(ref name) => name.clone(),
-            None => return Decision::allow(),
+            None => return AgentResponse::default_allow(),
+        };
+
+        // Decode body from base64
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let body = match STANDARD.decode(&event.data) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to decode response body from base64");
+                return AgentResponse::default_allow();
+            }
         };
 
         // Parse body as JSON if possible
-        let ctx = if let Some(body) = response.body() {
-            if let Ok(json) = serde_json::from_slice(body) {
-                stored.ctx.with_body_json(json)
-            } else {
-                stored.ctx
-            }
+        let ctx = if let Ok(json) = serde_json::from_slice(&body) {
+            stored.ctx.with_body_json(json)
         } else {
             stored.ctx
         };
@@ -507,11 +603,11 @@ impl Agent for TransformAgent {
         // Find the rule again
         let (rule, _) = match self.rule_engine.find_response_match(&ctx).await {
             Some((r, c)) => (r, c),
-            None => return Decision::allow(),
+            None => return AgentResponse::default_allow(),
         };
 
         // Apply body transformations
-        let result = match rule.transform_response(&ctx, response.body()).await {
+        let result = match rule.transform_response(&ctx, Some(&body)).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -520,26 +616,114 @@ impl Agent for TransformAgent {
                     error = %e,
                     "Response body transformation failed"
                 );
-                return Decision::allow();
+                self.transform_errors.fetch_add(1, Ordering::Relaxed);
+                return AgentResponse::default_allow();
             }
         };
 
         // Build decision with body mutation
-        let mut decision = Decision::allow();
+        let response = AgentResponse::default_allow();
 
         if let Some(body) = result.body {
-            decision = decision.with_response_body_mutation(BodyMutation::replace(
-                0,
-                String::from_utf8_lossy(&body).to_string(),
-            ));
             debug!(
                 correlation_id,
                 rule = %rule_name,
-                "Applied response body transformation"
+                body_size = body.len(),
+                "Response body transformation produced new body (mutation not supported in this version)"
             );
         }
 
-        decision
+        response
+    }
+
+    /// Return current health status.
+    fn health_status(&self) -> HealthStatus {
+        let agent_id = "transform".to_string();
+
+        if self.is_draining() {
+            HealthStatus::degraded(agent_id, vec!["draining".to_string()], 1.5)
+        } else {
+            HealthStatus::healthy(agent_id)
+        }
+    }
+
+    /// Return metrics report.
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        let mut report = MetricsReport::new("transform", 10_000);
+
+        report.counters.push(CounterMetric::new(
+            "transform_requests_total",
+            self.requests_total.load(Ordering::Relaxed),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "transform_requests_transformed_total",
+            self.requests_transformed.load(Ordering::Relaxed),
+        ));
+
+        report.counters.push(CounterMetric::new(
+            "transform_errors_total",
+            self.transform_errors.load(Ordering::Relaxed),
+        ));
+
+        // Current in-flight requests (contexts waiting)
+        let contexts_count = {
+            match self.request_contexts.try_read() {
+                Ok(contexts) => contexts.len() as f64,
+                Err(_) => 0.0,
+            }
+        };
+        report.gauges.push(GaugeMetric::new(
+            "transform_in_flight_requests",
+            contexts_count,
+        ));
+
+        // Number of configured rules
+        report.gauges.push(GaugeMetric::new(
+            "transform_rules_count",
+            self.rule_engine.rules().len() as f64,
+        ));
+
+        Some(report)
+    }
+
+    /// Handle configuration updates from proxy.
+    async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
+        info!(
+            config_version = ?version,
+            "Received configuration update"
+        );
+
+        // Log the configuration for debugging
+        debug!(config = %config, "Configuration payload");
+
+        // In a production implementation, you would parse and apply the new config
+        // For now, we accept all configurations
+        true
+    }
+
+    /// Handle shutdown request.
+    async fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            reason = ?reason,
+            grace_period_ms = grace_period_ms,
+            "Received shutdown request"
+        );
+
+        // Set draining to stop accepting new requests
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Handle drain request.
+    async fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        info!(
+            duration_ms = duration_ms,
+            reason = ?reason,
+            "Received drain request"
+        );
+
+        // Set draining flag
+        self.draining.store(true, Ordering::Relaxed);
     }
 }
 
@@ -578,7 +762,11 @@ mod tests {
         let params = parse_query_string(Some("tags=a&tags=b&tags=c"));
         assert_eq!(
             params.get("tags"),
-            Some(&vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            Some(&vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string()
+            ])
         );
     }
 
@@ -586,7 +774,9 @@ mod tests {
     async fn test_agent_creation() {
         let config = TransformConfig::default();
         let agent = TransformAgent::new(config).unwrap();
-        assert_eq!(agent.name(), "transform");
+        let caps = agent.capabilities();
+        assert_eq!(caps.agent_id, "transform");
+        assert_eq!(caps.name, "Transform Agent");
     }
 
     #[tokio::test]
@@ -598,7 +788,45 @@ settings:
 rules: []
 "#;
         let agent = TransformAgent::from_yaml(yaml).unwrap();
-        assert_eq!(agent.name(), "transform");
+        let caps = agent.capabilities();
+        assert_eq!(caps.agent_id, "transform");
         assert!(agent.config.settings.debug_headers);
+    }
+
+    #[test]
+    fn test_capabilities() {
+        let config = TransformConfig::default();
+        let agent = TransformAgent::new(config).unwrap();
+        let caps = agent.capabilities();
+
+        assert_eq!(caps.agent_id, "transform");
+        assert!(caps.supports_event(EventType::RequestHeaders));
+        assert!(caps.supports_event(EventType::ResponseHeaders));
+        assert!(caps.features.streaming_body);
+        assert!(caps.features.metrics_export);
+        assert!(caps.features.health_reporting);
+    }
+
+    #[test]
+    fn test_health_status() {
+        let config = TransformConfig::default();
+        let agent = TransformAgent::new(config).unwrap();
+        let health = agent.health_status();
+
+        assert!(health.is_healthy());
+        assert_eq!(health.agent_id, "transform");
+    }
+
+    #[test]
+    fn test_metrics_report() {
+        let config = TransformConfig::default();
+        let agent = TransformAgent::new(config).unwrap();
+        let report = agent.metrics_report();
+
+        assert!(report.is_some());
+        let report = report.unwrap();
+        assert_eq!(report.agent_id, "transform");
+        assert!(!report.counters.is_empty());
+        assert!(!report.gauges.is_empty());
     }
 }

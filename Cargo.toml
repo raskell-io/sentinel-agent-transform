@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-agent-transform"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Raskell <hello@raskell.io>"]
 description = "Request and response transformation agent for Sentinel proxy"
@@ -10,12 +10,12 @@ keywords = ["sentinel", "proxy", "agent", "transform", "rewrite"]
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
-# Sentinel SDK
-sentinel-agent-sdk = "0.1"
-sentinel-agent-protocol = { git = "https://github.com/raskell-io/sentinel.git", branch = "main" }
+# Sentinel Protocol
+sentinel-agent-protocol = "0.3"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+tonic = "0.12"
 async-trait = "0.1"
 
 # Serialization
@@ -32,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Pattern matching
 regex = "1"

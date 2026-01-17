@@ -59,13 +59,11 @@ impl JsonTransformer {
                 }
             }
             JsonOperation::Merge { path, with } => {
-                if let Some(target) = get_json_value_mut(&mut json, path) {
-                    if let JsonValue::Object(target_map) = target {
-                        if let JsonValue::Object(merge_map) = with {
-                            for (k, v) in merge_map {
-                                let interpolated = interpolate_json_value(v, ctx);
-                                target_map.insert(k.clone(), interpolated);
-                            }
+                if let Some(JsonValue::Object(target_map)) = get_json_value_mut(&mut json, path) {
+                    if let JsonValue::Object(merge_map) = with {
+                        for (k, v) in merge_map {
+                            let interpolated = interpolate_json_value(v, ctx);
+                            target_map.insert(k.clone(), interpolated);
                         }
                     }
                 }
@@ -232,7 +230,7 @@ fn set_json_value(json: &mut JsonValue, path: &str, value: JsonValue) -> Result<
                     }
                 } else {
                     // Ensure intermediate object exists
-                    if !current.get(key).is_some() {
+                    if current.get(key).is_none() {
                         if let JsonValue::Object(map) = current {
                             // Look ahead to see if next segment is index or key
                             let next_segment = &segments[i + 1];

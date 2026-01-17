@@ -28,7 +28,7 @@ impl BodyMatcherImpl {
     /// Compile a body matcher from configuration.
     pub fn compile(config: &BodyMatcher) -> Result<Self, MatcherError> {
         let conditions = config.json.as_ref()
-            .map(|conds| conds.iter().map(|c| compile_condition(c)).collect())
+            .map(|conds| conds.iter().map(compile_condition).collect())
             .unwrap_or_default();
 
         Ok(Self { conditions })
@@ -92,15 +92,11 @@ fn check_condition(json: &JsonValue, condition: &CompiledJsonCondition) -> bool 
     let value = get_json_value(json, &condition.path);
 
     match &condition.check {
-        JsonCheck::Equals(expected) => {
-            value.map_or(false, |v| v == expected)
-        }
+        JsonCheck::Equals(expected) => value == Some(expected),
         JsonCheck::Contains(substr) => {
-            value.map_or(false, |v| {
-                match v {
-                    JsonValue::String(s) => s.contains(substr),
-                    _ => v.to_string().contains(substr),
-                }
+            value.is_some_and(|v| match v {
+                JsonValue::String(s) => s.contains(substr),
+                _ => v.to_string().contains(substr),
             })
         }
         JsonCheck::Exists => value.is_some(),

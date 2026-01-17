@@ -59,13 +59,13 @@ impl Matcher for HeaderMatcherImpl {
 
         let matched = match &self.condition {
             HeaderCondition::Equals(expected) => {
-                header_value.map_or(false, |v| v == expected)
+                header_value.is_some_and(|v| v == expected)
             }
             HeaderCondition::Contains(substr) => {
-                header_value.map_or(false, |v| v.contains(substr))
+                header_value.is_some_and(|v| v.contains(substr))
             }
             HeaderCondition::Matches(regex) => {
-                header_value.map_or(false, |v| regex.is_match(v))
+                header_value.is_some_and(|v| regex.is_match(v))
             }
             HeaderCondition::Present => header_value.is_some(),
             HeaderCondition::Absent => header_value.is_none(),

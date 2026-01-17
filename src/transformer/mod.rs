@@ -175,6 +175,7 @@ impl TransformerChain {
     }
 
     /// Add a transformer to the chain.
+    #[allow(clippy::should_implement_trait)]
     pub fn add<T: Transformer + 'static>(mut self, transformer: T) -> Self {
         self.transformers.push(Box::new(transformer));
         self

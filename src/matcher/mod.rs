@@ -82,7 +82,7 @@ impl CompiledMatcher {
     /// Compile a rule matcher from configuration.
     pub fn compile(config: &RuleMatcher) -> Result<Self, MatcherError> {
         let path = config.path.as_ref()
-            .map(|p| PathMatcherImpl::compile(p))
+            .map(PathMatcherImpl::compile)
             .transpose()?;
 
         let methods = config.methods.clone();
@@ -93,7 +93,7 @@ impl CompiledMatcher {
             .unwrap_or_default();
 
         let body = config.body.as_ref()
-            .map(|b| BodyMatcherImpl::compile(b))
+            .map(BodyMatcherImpl::compile)
             .transpose()?;
 
         let response = config.response.as_ref()

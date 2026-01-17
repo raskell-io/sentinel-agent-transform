@@ -114,8 +114,8 @@ impl TransformContext {
         let parts: Vec<&str> = expr.splitn(2, '.').collect();
 
         match parts[0] {
-            "request" => self.resolve_request(&parts.get(1).unwrap_or(&"")),
-            "response" => self.resolve_response(&parts.get(1).unwrap_or(&"")),
+            "request" => self.resolve_request(parts.get(1).unwrap_or(&"")),
+            "response" => self.resolve_response(parts.get(1).unwrap_or(&"")),
             "captures" => {
                 let key = parts.get(1)?;
                 self.captures.get(*key).cloned()
